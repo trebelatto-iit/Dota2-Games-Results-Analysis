@@ -1,0 +1,480 @@
+---
+title: "Dota 2"
+output: html_document
+date: "2026-07-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# DOTA 2
+
+## Packages
+
+```{r}
+library(glmnet)
+library(tidyverse)
+library(jsonlite)
+library(rpart)
+library(e1071)
+library(ranger)
+library(xgboost)
+```
+
+## EDA
+
+```{r}
+train <- read.csv("data/dota2Train.csv", header = FALSE)
+test  <- read.csv("data/dota2Test.csv",  header = FALSE)
+
+base_names <- c("winner", "cluster_id", "game_mode", "game_type")
+hero_names <- paste0("hero_", seq_len(ncol(train) - 4))
+colnames(train) <- c(base_names, hero_names)
+colnames(test)  <- c(base_names, hero_names)
+```
+
+```{r}
+heroes <- fromJSON("data/heroes.json")$heroes
+heroes <- heroes[order(heroes$id), ]
+```
+
+```{r}
+nrow(heroes)                      # number of heroes in the JSON
+sum(grepl("^hero_", names(train)))  # number of hero columns in the data (should be 113)
+head(heroes[, c("id", "localized_name")])
+```
+
+```{r}
+dim(train)
+dim(test)
+```
+
+```{r}
+str(train[, 1:4])   # only leading columns; 113 hero cols omitted for readability
+head(train[, 1:6])
+
+```
+
+```{r}
+sum(is.na(train))
+sum(is.na(test))
+```
+
+```{r}
+winner_tbl <- table(train$winner)
+winner_tbl
+prop.table(winner_tbl)
+```
+
+```{r}
+barplot(winner_tbl,
+        col = "steelblue",
+        xlab = "Winning team (1 vs -1)",
+        ylab = "Games",
+        main = "Match outcome distribution")
+```
+
+```{r}
+sort(table(train$game_mode), decreasing = TRUE)
+sort(table(train$game_type), decreasing = TRUE)
+head(sort(table(train$cluster_id), decreasing = TRUE), 15)
+```
+
+```{r}
+hero_cols <- train[, grep("^hero_", names(train))]
+
+pick_freq <- data.frame(
+  hero = names(hero_cols),
+  picks = colSums(hero_cols != 0)
+)
+pick_freq <- pick_freq[order(-pick_freq$picks), ]
+head(pick_freq, 15)
+```
+
+```{r}
+top20 <- head(pick_freq, 20)
+top20 <- top20[order(top20$picks), ]   # ascending so largest ends on top
+barplot(top20$picks,
+        names.arg = top20$hero,
+        horiz = TRUE,
+        las = 1,
+        col = "darkorange",
+        cex.names = 0.7,
+        xlab = "Times picked",
+        main = "Top 20 most-picked heroes")
+```
+
+```{r}
+win_rate <- data.frame(hero = character(), games = integer(), win_rate = numeric())
+for (h in names(hero_cols)) {
+  picked   <- hero_cols[[h]] != 0
+  side_won <- train$winner[picked] == hero_cols[[h]][picked]
+  win_rate <- rbind(win_rate,
+                    data.frame(hero = h,
+                               games = sum(picked),
+                               win_rate = mean(side_won)))
+}
+win_rate <- win_rate[win_rate$games > 0, ]
+win_rate <- win_rate[order(-win_rate$win_rate), ]
+head(win_rate, 15)
+```
+
+```{r}
+picks_per_game <- rowSums(hero_cols != 0)
+table(picks_per_game)
+```
+
+## Model Training
+
+```{r}
+prep <- function(df) {
+  df$winner <- ifelse(df$winner == 1, 1, 0)
+  df
+}
+train_m <- prep(train)
+test_m  <- prep(test)
+
+# Helper: misclassification error rate
+err_rate <- function(pred_class, actual) mean(pred_class != actual)
+```
+
+### Logistic Regression
+
+```{r}
+# ---- Logistic regression (base R glm) ----
+logit_fit <- glm(winner ~ ., data = train_m, family = binomial())
+
+# Predicted probabilities -> class at 0.5 threshold
+logit_train_p <- predict(logit_fit, train_m, type = "response")
+logit_test_p  <- predict(logit_fit, test_m,  type = "response")
+logit_train_c <- ifelse(logit_train_p > 0.5, 1, 0)
+logit_test_c  <- ifelse(logit_test_p  > 0.5, 1, 0)
+
+logit_train_err <- err_rate(logit_train_c, train_m$winner)
+logit_test_err  <- err_rate(logit_test_c,  test_m$winner)
+
+cat("Logistic  train error:", round(logit_train_err, 4),
+    " test error:", round(logit_test_err, 4), "\n")
+```
+
+```{r}
+# Confusion matrix on test set
+logit_cm <- table(Predicted = logit_test_c, Actual = test_m$winner)
+print(logit_cm)
+```
+
+```{r}
+# glmnet needs matrix X and numeric 0/1 y (reuse from xgboost prep)
+# alpha = 1 is lasso (L1); cv.glmnet picks lambda by cross-validation
+set.seed(1)
+cv_fit <- cv.glmnet(X_train, y_train, family = "binomial",
+                    alpha = 1, type.measure = "class")
+```
+
+```{r}
+# lambda.min = lowest CV error; lambda.1se = simplest model within 1 SE
+plot(cv_fit)
+cat("lambda.min:", cv_fit$lambda.min,
+    " lambda.1se:", cv_fit$lambda.1se, "\n")
+```
+
+```{r}
+# Test error at lambda.min
+glmnet_test_p <- predict(cv_fit, X_test, s = "lambda.min", type = "response")
+glmnet_test_c <- ifelse(glmnet_test_p > 0.5, 1, 0)
+glmnet_test_err <- err_rate(glmnet_test_c, y_test)
+
+cat("glmnet (lasso) test error:", round(glmnet_test_err, 4), "\n")
+```
+
+```{r}
+# Nonzero coefficients at lambda.1se = the heroes lasso kept
+coefs <- coef(cv_fit, s = "lambda.1se")
+kept <- data.frame(
+  feature = rownames(coefs)[which(coefs != 0)],
+  coefficient = coefs[which(coefs != 0)]
+)
+kept <- kept[order(-abs(kept$coefficient)), ]
+cat("Features retained:", nrow(kept) - 1, "of", ncol(X_train), "\n")  # -1 for intercept
+print(head(kept, 20))
+```
+
+```{r}
+# Attach hero names to retained coefficients (heroes loaded + sorted by id earlier)
+kept_heroes <- kept[grepl("^hero_", kept$feature), ]
+kept_heroes$name <- heroes$localized_name[
+  match(kept_heroes$feature, paste0("hero_", seq_len(nrow(heroes))))
+]
+print(head(kept_heroes[, c("name", "coefficient")], 20))
+```
+
+### Decision Tree
+
+```{r}
+# ---- Decision tree (rpart) ----
+# winner must be a factor for classification (else rpart does regression)
+train_t <- train_m; train_t$winner <- factor(train_t$winner)
+test_t  <- test_m;  test_t$winner  <- factor(test_t$winner)
+
+tree_fit <- rpart(winner ~ ., data = train_t, method = "class")
+
+tree_train_c <- predict(tree_fit, train_t, type = "class")
+tree_test_c  <- predict(tree_fit, test_t,  type = "class")
+
+tree_train_err <- err_rate(tree_train_c, train_t$winner)
+tree_test_err  <- err_rate(tree_test_c,  test_t$winner)
+
+cat("Tree      train error:", round(tree_train_err, 4),
+    " test error:", round(tree_test_err, 4), "\n")
+```
+
+```{r}
+# Visualize the tree (base rpart plotting, no extra packages)
+plot(tree_fit, uniform = TRUE, margin = 0.1,
+     main = "Decision tree: predicting winning team")
+text(tree_fit, use.n = TRUE, cex = 0.7)
+```
+
+```{r}
+# Complexity table — used for pruning (see tuning notes)
+printcp(tree_fit)
+plotcp(tree_fit)
+```
+
+### Naive Bayes
+
+```{r}
+# ---- Naive Bayes (e1071) ----
+nb_fit <- naiveBayes(winner ~ ., data = train_t)
+
+nb_train_c <- predict(nb_fit, train_t)
+nb_test_c  <- predict(nb_fit, test_t)
+
+nb_train_err <- err_rate(nb_train_c, train_t$winner)
+nb_test_err  <- err_rate(nb_test_c,  test_t$winner)
+
+cat("NaiveBayes train error:", round(nb_train_err, 4),
+    " test error:", round(nb_test_err, 4), "\n")
+```
+
+```{r}
+{r}
+# ---- Compare test error rates across models ----
+errs <- c(Logistic = logit_test_err,
+          Tree     = tree_test_err,
+          NaiveBayes = nb_test_err)
+
+bp <- barplot(errs, col = "steelblue", ylim = c(0, max(errs) * 1.2),
+              ylab = "Test misclassification rate",
+              main = "Model comparison (lower is better)")
+text(bp, errs, labels = round(errs, 3), pos = 3)
+abline(h = 0.5, lty = 2, col = "red")   # 0.5 = coin-flip baseline
+```
+
+### Random Forest
+
+```{r}
+library(ranger)
+
+# probability = TRUE makes ranger output class probabilities,
+# so the same 0.5 threshold rule applies as logistic regression
+rf_fit <- ranger(
+  winner ~ .,
+  data = train_t,
+  probability = TRUE,
+  num.trees = 500,
+  importance = "impurity"
+)
+```
+
+```{r}
+# Predict probabilities; column "1" is P(team 1 wins)
+rf_train_p <- predict(rf_fit, train_t)$predictions[, "1"]
+rf_test_p  <- predict(rf_fit, test_t)$predictions[, "1"]
+
+rf_train_c <- ifelse(rf_train_p > 0.5, 1, 0)
+rf_test_c  <- ifelse(rf_test_p  > 0.5, 1, 0)
+
+# actuals back to 0/1 numeric to match predicted classes
+rf_train_err <- err_rate(rf_train_c, as.numeric(as.character(train_t$winner)))
+rf_test_err  <- err_rate(rf_test_c,  as.numeric(as.character(test_t$winner)))
+
+cat("RandomForest train error:", round(rf_train_err, 4),
+    " test error:", round(rf_test_err, 4), "\n")
+```
+
+```{r}
+# Confusion matrix on test set
+rf_cm <- table(Predicted = rf_test_c,
+               Actual = as.numeric(as.character(test_t$winner)))
+print(rf_cm)
+```
+
+```{r}
+# Top 20 heroes by impurity importance (feature signal, not direction)
+imp <- sort(rf_fit$variable.importance, decreasing = TRUE)
+imp20 <- rev(imp[1:20])   # ascending so largest ends on top
+
+par(mar = c(4, 8, 3, 1))
+barplot(imp20, horiz = TRUE, las = 1, col = "darkgreen",
+        cex.names = 0.7, xlab = "Impurity importance",
+        main = "Top 20 heroes by RF importance")
+```
+
+### XGBoost
+
+```{r}
+# xgboost needs numeric matrix X and numeric 0/1 label y
+feat_cols <- setdiff(names(train_m), "winner")
+X_train <- as.matrix(train_m[, feat_cols])
+X_test  <- as.matrix(test_m[,  feat_cols])
+y_train <- train_m$winner   # already 0/1 from prep()
+y_test  <- test_m$winner
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+```
+
+```{r}
+# Baseline params — deliberately untuned, just defaults with logistic objective
+xgb_fit <- xgboost(
+  x = X_train,
+  y = factor(y_train),   # new interface wants a factor for classification
+  nrounds = 100,
+  verbose = 0
+)
+```
+
+```{r}
+xgb_train_p <- predict(xgb_fit, X_train)
+xgb_test_p  <- predict(xgb_fit, X_test)
+
+xgb_train_c <- ifelse(xgb_train_p > 0.5, 1, 0)
+xgb_test_c  <- ifelse(xgb_test_p  > 0.5, 1, 0)
+
+xgb_train_err <- err_rate(xgb_train_c, y_train)
+xgb_test_err  <- err_rate(xgb_test_c,  y_test)
+
+cat("XGBoost train error:", round(xgb_train_err, 4),
+    " test error:", round(xgb_test_err, 4), "\n")
+```
+
+```{r}
+# Compare all models on test error
+all_errs <- c(Logistic   = logit_test_err,
+              Tree       = tree_test_err,
+              NaiveBayes = nb_test_err,
+              RandomForest = rf_test_err,
+              XGBoost    = xgb_test_err)
+
+bp <- barplot(all_errs, col = "steelblue", ylim = c(0, max(all_errs) * 1.2),
+              ylab = "Test misclassification rate", las = 2,
+              main = "Model comparison (lower is better)")
+text(bp, all_errs, labels = round(all_errs, 3), pos = 3)
+abline(h = 0.5, lty = 2, col = "red")
+```
+
+### Pairwise Comparison
+
+```{r}
+# Hero matrix (games x 113), values 1 / -1 / 0
+hero_idx <- grep("^hero_", names(train))
+H <- as.matrix(train[, hero_idx])
+hero_ids <- colnames(H)
+
+# Presence masks and outcomes
+T1 <- (H == 1)          # hero on team 1
+T2 <- (H == -1)         # hero on team 2
+win1 <- train$winner == 1   # team 1 won
+win2 <- train$winner == -1  # team 2 won
+
+n_games <- nrow(H)
+```
+
+```{r}
+# Individual hero win rates (baseline for expected pair performance)
+solo_games <- colSums(T1) + colSums(T2)
+solo_wins  <- colSums(T1 & win1) + colSums(T2 & win2)
+solo_wr    <- solo_wins / solo_games
+```
+
+```{r}
+# ---- SYNERGY: two heroes on the SAME team ----
+# Co-occurrence count on same team (symmetric matrix, diagonal = solo counts)
+same_count <- t(T1) %*% T1 + t(T2) %*% T2
+# Times that shared team won
+same_wins  <- t(T1) %*% (T1 * win1) + t(T2) %*% (T2 * win2)
+
+# Extract upper triangle (unique pairs, exclude diagonal)
+ut <- which(upper.tri(same_count), arr.ind = TRUE)
+syn <- data.frame(
+  hero_a = hero_ids[ut[, 1]],
+  hero_b = hero_ids[ut[, 2]],
+  games  = same_count[ut],
+  pair_wr = same_wins[ut] / same_count[ut]
+)
+
+# Expected win rate = average of the two solo rates
+syn$expected_wr <- (solo_wr[ut[, 1]] + solo_wr[ut[, 2]]) / 2
+syn$synergy <- syn$pair_wr - syn$expected_wr
+
+# Filter to pairs with enough games to be meaningful
+syn <- syn[syn$games >= 30, ]
+```
+
+```{r}
+# Top synergies (overperform expectation) and anti-synergies (underperform)
+syn <- syn[order(-syn$synergy), ]
+cat("Strongest synergies:\n");     print(head(syn, 15), row.names = FALSE)
+cat("\nStrongest anti-synergies:\n"); print(head(syn[order(syn$synergy), ], 15), row.names = FALSE)
+```
+
+```{r}
+# ---- COUNTERS: hero i on team 1 vs hero j on team 2 ----
+opp_count <- t(T1) %*% T2                    # [i,j] = games i(team1) faced j(team2)
+opp_wins  <- t(T1 * win1) %*% T2             # [i,j] = those games team 1 (hero i) won
+
+# All i,j (not symmetric — direction matters), exclude same-hero diagonal
+allij <- which(row(opp_count) != col(opp_count), arr.ind = TRUE)
+ctr <- data.frame(
+  hero    = hero_ids[allij[, 1]],
+  against = hero_ids[allij[, 2]],
+  games   = opp_count[allij],
+  wr_vs   = opp_wins[allij] / opp_count[allij]
+)
+ctr <- ctr[ctr$games >= 30, ]
+ctr <- ctr[order(-ctr$wr_vs), ]
+cat("Strongest counters (hero beats 'against'):\n")
+print(head(ctr, 15), row.names = FALSE)
+```
+
+```{r}
+# Attach hero names (heroes loaded + sorted by id earlier)
+id_to_name <- setNames(heroes$localized_name,
+                       paste0("hero_", seq_len(nrow(heroes))))
+syn$name_a <- id_to_name[syn$hero_a]
+syn$name_b <- id_to_name[syn$hero_b]
+ctr$name    <- id_to_name[ctr$hero]
+ctr$vs_name <- id_to_name[ctr$against]
+
+cat("Top synergies (named):\n")
+print(head(syn[, c("name_a", "name_b", "games", "synergy")], 15), row.names = FALSE)
+```
+
+```{r}
+# Distribution of synergy values — is there real structure or is it ~0?
+hist(syn$synergy, breaks = 50, col = "steelblue",
+     xlab = "Pair win rate − expected", main = "Synergy distribution")
+abline(v = 0, col = "red", lwd = 2)
+cat("SD of synergy:", round(sd(syn$synergy), 4),
+    " | mean abs:", round(mean(abs(syn$synergy)), 4), "\n")
+```
+
+```{r}
+hist(solo_wr, breaks = 30, col = "steelblue",
+     xlab = "Individual hero win rate", main = "Distribution of solo win rates")
+abline(v = 0.5, col = "red", lwd = 2)
+cat("Solo win rate range:", round(range(solo_wr), 3),
+    " SD:", round(sd(solo_wr), 3), "\n")
+```
