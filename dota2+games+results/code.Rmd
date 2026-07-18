@@ -1,0 +1,477 @@
+---
+title: "dota2"
+output: html_document
+date: "2026-07-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup
+
+```{r echo=FALSE}
+library(glmnet)
+library(tidyverse)
+library(jsonlite)
+library(rpart)
+library(e1071)
+library(ranger)
+library(xgboost)
+library(ggplot2)
+library(pROC)
+```
+
+```{r}
+train <- read.csv("data/dota2Train.csv", header = FALSE)
+test  <- read.csv("data/dota2Test.csv",  header = FALSE)
+
+base_names <- c("winner", "cluster_id", "game_mode", "game_type")
+hero_names <- paste0("hero_", seq_len(ncol(train) - 4))
+colnames(train) <- c(base_names, hero_names)
+colnames(test)  <- c(base_names, hero_names)
+```
+
+```{r}
+dim(train)
+dim(test)
+```
+
+```{r}
+head(train)
+```
+
+```{r}
+sort(table(train$game_mode),  decreasing = TRUE)
+sort(table(train$game_type),  decreasing = TRUE)
+```
+
+92k matches to train on, with the following predictors:
+
+113 Unique heroes: 5 per team, with (1, -1) encoding which team each hero is on.
+
+Game mode: Integer value (1,9)
+
+Game Type: Integer value (1,3)
+
+Winner: 1 or -1 to indicate which team won
+
+```{r}
+  
+# Hero names JSON
+# Attach later 
+
+heroes <- fromJSON("data/heroes.json")$heroes
+heroes <- heroes[order(heroes$id), ]
+
+nrow(heroes)                     
+sum(grepl("^hero_", names(train)))  
+head(heroes[, c("id", "localized_name")])
+```
+
+# Baseline
+
+Using decimal rounded to 4 decimal places to compare test error values. Percentages used to contextualizing results.
+
+```{r}
+win_tbl <- table(train$winner)
+win_pct <- round(100 * win_tbl / sum(win_tbl), 1)
+win_labels <- paste0(c("Team -1", "Team 1"), ": ", win_pct, "%")
+
+pie(win_tbl,
+    labels = win_labels,
+    col = c("tomato", "steelblue"),
+    main = "Match outcome distribution")
+```
+
+```{r}
+prop.table(table(train$winner))
+prop.table(table(test$winner))
+```
+
+Both train and test data sets have similar class balance, as expected.
+
+```{r}
+# Majority class from training data
+majority_class <- as.numeric(names(which.max(table(train$winner))))
+cat("Majority class (from train):", majority_class, "\n")
+
+# Predict that class for every test row
+baseline_pred <- rep(majority_class, nrow(test))
+
+# Baseline test error
+baseline_err <- mean(baseline_pred != test$winner)
+cat("Majority-class baseline test error:", round(baseline_err, 4), "\n")
+cat("Baseline test accuracy:", round(1 - baseline_err, 4), "\n")
+```
+
+Team 1 wins \~53% of the team in both the training and test data, if we predict team 1 every time, we got \~53% accuracy and thus baseline test error of \~47%.
+
+Baseline:
+
+test error: 0.4655
+
+test accuracy: 0.5345
+
+# Model Training
+
+```{r}
+prep <- function(df) {
+  df$winner <- ifelse(df$winner == 1, 1, 0)
+  df
+}
+train_m <- prep(train)
+test_m  <- prep(test)
+
+err_rate <- function(pred_class, actual) mean(pred_class != actual)
+```
+
+```{r}
+head(train_m)
+```
+
+## Logistic Regression
+
+```{r}
+logit_fit <- glm(winner ~ ., data = train_m, family = binomial())
+
+logit_train_p <- predict(logit_fit, train_m, type = "response")
+logit_test_p  <- predict(logit_fit, test_m,  type = "response")
+logit_train_c <- ifelse(logit_train_p > 0.5, 1, 0)
+logit_test_c  <- ifelse(logit_test_p  > 0.5, 1, 0)
+
+logit_train_err <- err_rate(logit_train_c, train_m$winner)
+logit_test_err  <- err_rate(logit_test_c,  test_m$winner)
+
+cat("Logistic  train error:", round(logit_train_err, 4),
+    " test error:", round(logit_test_err, 4), "\n")
+```
+
+```{r}
+logit_cm <- table(Predicted = logit_test_c, Actual = test_m$winner)
+print(logit_cm)
+```
+
+```{r}
+cm_df <- as.data.frame(logit_cm)
+
+ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 6) +
+  scale_fill_gradient(low = "steelblue", high = "darkblue") +
+  labs(title = "Logistic regression confusion matrix (test)")
+```
+
+```{r}
+TP <- logit_cm["1", "1"]
+FP <- logit_cm["1", "0"]
+FN <- logit_cm["0", "1"]
+TN <- logit_cm["0", "0"]
+
+accuracy  <- (TP + TN) / sum(logit_cm)
+precision <- TP / (TP + FP)
+recall    <- TP / (TP + FN)     
+specificity <- TN / (TN + FP)
+f1        <- 2 * precision * recall / (precision + recall)
+
+cat(sprintf("Accuracy:    %.4f\n", accuracy))
+cat(sprintf("Precision:   %.4f\n", precision))
+cat(sprintf("Recall:      %.4f\n", recall))
+cat(sprintf("Specificity: %.4f\n", specificity))
+cat(sprintf("F1 score:    %.4f\n", f1))
+```
+
+```{r, message=FALSE, warning=FALSE}
+roc_obj <- roc(test_m$winner, logit_test_p)
+plot(roc_obj, main = "Logistic regression ROC (test)", col = "steelblue", lwd = 2)
+```
+
+```{r echo = FALSE}
+cat("AUC:", round(auc(roc_obj), 4), "\n")
+```
+
+```{r}
+bins <- cut(logit_test_p, breaks = seq(0, 1, 0.1), include.lowest = TRUE)
+cal <- aggregate(test_m$winner, list(bin = bins), mean)
+cal$midpoint <- seq(0.05, 0.95, 0.1)[as.integer(cal$bin)]
+
+plot(cal$midpoint, cal$x, type = "b", pch = 19, col = "steelblue",
+     xlim = c(0, 1), ylim = c(0, 1),
+     xlab = "Predicted win probability", ylab = "Observed win frequency",
+     main = "Calibration plot (logistic, test)")
+abline(0, 1, lty = 2, col = "red")   # perfect calibration = diagonal
+```
+
+### Results
+
+The logistic regression model was able to improve upon the baseline, going from a test accuracy of 0.5345 to 0.5978. The training and test error were nearly identical at 0.3991 for training and 0.4022 for test, indicating that the model did not over-fit to the training data.
+
+The area under the ROC curve is indicated as 0.6342. This means that given a random game team 1 won and a random game team 1 lost, the model assigns the won game a higher predicted probability \~63% of the time, which is an improvement over the 0.50 random-ranking baseline.
+
+The calibration plot shows a curve pretty close to diagonal. This tells us that although that model is not perfectly accurate, it is well-calibrated. This may indicate that hero picks alone may not be able to pick the match winner with significantly more accuracy than the \~60% achieved by this model. However, more testing is required.
+
+## Lasso
+
+```{r}
+feat_cols <- setdiff(names(train_m), "winner")
+X_train <- as.matrix(train_m[, feat_cols])
+X_test  <- as.matrix(test_m[,  feat_cols])
+y_train <- train_m$winner 
+y_test  <- test_m$winner
+
+set.seed(1)
+cv_fit <- cv.glmnet(X_train, y_train, family = "binomial",
+                    alpha = 1, type.measure = "class")
+```
+
+```{r}
+# Test error at lambda.min and lambda.1se
+p_min <- predict(cv_fit, X_test, s = "lambda.min", type = "response")
+p_1se <- predict(cv_fit, X_test, s = "lambda.1se", type = "response")
+
+lasso_err_min <- err_rate(ifelse(p_min > 0.5, 1, 0), y_test)
+lasso_err_1se <- err_rate(ifelse(p_1se > 0.5, 1, 0), y_test)
+
+cat("Lasso test error (lambda.min):", round(lasso_err_min, 4), "\n")
+cat("Lasso test error (lambda.1se):", round(lasso_err_1se, 4), "\n")
+cat("lambda.min:", round(cv_fit$lambda.min, 5),
+    " lambda.1se:", round(cv_fit$lambda.1se, 5), "\n")
+```
+
+```{r}
+# 1. Lasso CV error vs. Lambda
+plot(cv_fit)
+title("Lasso CV error vs lambda", line = 2.5)
+```
+
+```{r}
+# 2. Coefficient shrinkage path — how features drop out as penalty rises
+fit_full <- glmnet(X_train, y_train, family = "binomial", alpha = 1)
+plot(fit_full, xvar = "lambda", label = FALSE)
+title("Coefficient paths (lasso)", line = 2.5)
+abline(v = log(cv_fit$lambda.1se), lty = 2, col = "red")
+```
+
+```{r}
+# 3. Retained heroes at lambda.1se, ranked by coefficient magnitude
+coefs <- coef(cv_fit, s = "lambda.1se")
+kept <- data.frame(
+  feature = rownames(coefs)[which(coefs != 0)],
+  coefficient = coefs[which(coefs != 0)]
+)
+kept <- kept[kept$feature != "(Intercept)", ]
+kept <- kept[order(-abs(kept$coefficient)), ]
+
+cat("Features retained:", nrow(kept), "of", ncol(X_train), "\n")
+```
+
+```{r}
+# 4. Top +/- coefficients as a horizontal bar chart
+top_n <- 20
+top_coefs <- head(kept, top_n)
+top_coefs <- top_coefs[order(top_coefs$coefficient), ]
+
+par(mar = c(4, 8, 3, 1))
+barplot(top_coefs$coefficient, names.arg = top_coefs$feature,
+        horiz = TRUE, las = 1, cex.names = 0.6,
+        col = ifelse(top_coefs$coefficient > 0, "steelblue", "tomato"),
+        xlab = "Coefficient (log-odds)",
+        main = "Top lasso coefficients (blue = ↑ team-1 win)")
+abline(v = 0, col = "gray40")
+```
+
+Here, both $\lambda_{min}$ and $\lambda_{1se}$ provide nearly identical test errors, with:
+
+$\lambda_{min} = 0.4032$
+
+$\lambda_{1se} = 0.4041$
+
+The difference between the two values is 0.0009, which is insignificant. $\lambda_{min}$ retained 107 features, while $\lambda_{1se}$ retained fewer at 96 features, yet they produce nearly identical results on this data, and even the sparser model retains most of the roster (96 of 113 heroes). The 96 features being retained indicates that the predictive signal is spread thinly across nearly the entire roster rather than concentrated in a few decisive heroes.
+
+Since lasso's regularization didn't improve or hurt our results relative to the plain logistic regression, we will test whether hero combinations can predict the results of the match. LR and Lasso cannot test this due to their additive structure, so we will shift to XGBoost, a gradient-boosted tree model capable of capturing interactions between hero picks. If interactions carry meaningful signal, XGBoost should improve on the linear ceiling of \~0.40. If not, it may be further confirmation that the \~0.40 ceiling reflects the data itself, meaning hero picks alone cannot predict match winner beyond 60% accuracy in this dataset.
+
+##  XGBoost
+
+```{r}
+feat_cols <- setdiff(names(train_m), "winner")
+X_train <- as.matrix(train_m[, feat_cols])
+X_test  <- as.matrix(test_m[,  feat_cols])
+y_train <- train_m$winner
+y_test  <- test_m$winner
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+```
+
+```{r}
+# Baseline model
+
+evals <- list(train = dtrain, test = dtest)
+
+xgb_fit <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "error",
+    max_depth = 4,
+    eta = 0.1
+  ),
+  data = dtrain,
+  nrounds = 200,
+  evals = evals,     
+  verbose = 0
+)
+```
+
+```{r}
+# Test error at 0.5 threshold, comparable to LR/lasso
+xgb_test_p <- predict(xgb_fit, X_test)
+xgb_train_p <- predict(xgb_fit, X_train)
+xgb_test_c <- ifelse(xgb_test_p > 0.5, 1, 0)
+xgb_train_c <- ifelse(xgb_train_p > 0.5, 1, 0)
+
+xgb_test_err  <- err_rate(xgb_test_c,  y_test)
+xgb_train_err <- err_rate(xgb_train_c, y_train)
+
+cat("XGBoost train error:", round(xgb_train_err, 4),
+    " test error:", round(xgb_test_err, 4), "\n")
+```
+
+```{r}
+# train vs test error across boosting rounds.
+
+log_df <- attr(xgb_fit, "evaluation_log")
+
+plot(log_df$iter, log_df$train_error, type = "l", col = "steelblue", lwd = 2,
+     ylim = range(c(log_df$train_error, log_df$test_error)),
+     xlab = "Boosting round", ylab = "Error",
+     main = "XGBoost learning curve")
+lines(log_df$iter, log_df$test_error, col = "tomato", lwd = 2)
+legend("topright", legend = c("Train", "Test"),
+       col = c("steelblue", "tomato"), lwd = 2, bty = "n")
+```
+
+As we can see on the learning curve, training error improves through all 200 boosting rounds, reaching 0.3774 error, which would be an improvement over the linear models (LR, Lasso). However, test error splits from training at around \~25 rounds and starts to plateau. stabilizing at 0.4057. This further indicates that we may have reached a ceiling with \~0.40 error.
+
+### Tuning XBG
+
+```{r}
+set.seed(1)
+
+grid <- expand.grid(
+  max_depth = c(3, 4, 6),
+  min_child_weight = c(1, 5),
+  subsample = c(0.8, 1.0),
+  colsample_bytree = c(0.8, 1.0)
+)
+
+results <- data.frame()
+
+for (i in seq_len(nrow(grid))) {
+  cv <- xgb.cv(
+    params = list(
+      objective = "binary:logistic",
+      eval_metric = "error",
+      eta = 0.1,
+      max_depth = grid$max_depth[i],
+      min_child_weight = grid$min_child_weight[i],
+      subsample = grid$subsample[i],
+      colsample_bytree = grid$colsample_bytree[i]
+    ),
+    data = dtrain, nrounds = 500, nfold = 5,
+    early_stopping_rounds = 20, verbose = 0
+  )
+  
+  log <- as.data.frame(cv$evaluation_log)          # $ not attr()
+  err_col <- grep("test.*error.*mean", names(log), value = TRUE)[1]
+  best_iter <- which.min(log[[err_col]])
+  
+  results <- rbind(results, cbind(
+    grid[i, ],
+    best_round = best_iter,
+    cv_error   = log[[err_col]][best_iter]
+  ))
+}
+
+results <- results[order(results$cv_error), ]
+print(results)
+```
+
+```{r}
+best <- results[1, ]
+set.seed(1)
+xgb_tuned <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "error",
+    eta = 0.1,
+    max_depth = best$max_depth,
+    min_child_weight = best$min_child_weight,
+    subsample = best$subsample,
+    colsample_bytree = best$colsample_bytree
+  ),
+  data = dtrain,
+  nrounds = best$best_round,
+  verbose = 0
+)
+
+tuned_test_p  <- predict(xgb_tuned, X_test)
+tuned_train_p <- predict(xgb_tuned, X_train)
+tuned_test_err  <- err_rate(ifelse(tuned_test_p  > 0.5, 1, 0), y_test)
+tuned_train_err <- err_rate(ifelse(tuned_train_p > 0.5, 1, 0), y_train)
+
+cat("Tuned XGBoost train error:", round(tuned_train_err, 4),
+    " test error:", round(tuned_test_err, 4),
+    " gap:", round(tuned_test_err - tuned_train_err, 4), "\n")
+cat("(depth", best$max_depth,
+    "min_child", best$min_child_weight,
+    "subsample", best$subsample,
+    "colsample", best$colsample_bytree,
+    "rounds", best$best_round, ")\n")
+```
+
+The tuned XGBoost model achieved a test error of 0.4031, effectively identical to logistic regression (0.402) and lasso (0.403), while training error settled at 0.3721 for a train-test gap of about 3 percentage points. We used xgb.cv to run a 5-fold cross validation across XGBoost regularization settings (tree depth, min. child weight, row/col sub-sampling). It selected the configuration with the lowest cross-validated error (depth = 4, min_child = 5, subsample = 0.8, colsample = 0.8, rounds = 281). Even so, the model was not able to close the gap between training and test error, and was not able to significantly improve on test error. A principled hyper-parameter search over a model class specifically capable of capturing hero interactions still lands at exactly the same \~0.40 wall as the additive linear models, which is strong evidence that the ceiling is a property of the data rather than of any one modeling choice
+
+## Synergy
+
+```{r}
+hero_idx <- grep("^hero_", names(train))
+H <- as.matrix(train[, hero_idx])
+hero_ids <- colnames(H)
+
+T1 <- (H == 1); T2 <- (H == -1)
+win1 <- train$winner == 1; win2 <- train$winner == -1
+
+solo_games <- colSums(T1) + colSums(T2)
+solo_wins  <- colSums(T1 & win1) + colSums(T2 & win2)
+solo_wr    <- solo_wins / solo_games
+```
+
+```{r}
+same_count <- t(T1) %*% T1 + t(T2) %*% T2
+same_wins  <- t(T1) %*% (T1 * win1) + t(T2) %*% (T2 * win2)
+
+ut <- which(upper.tri(same_count), arr.ind = TRUE)
+syn <- data.frame(
+  games   = same_count[ut],
+  pair_wr = same_wins[ut] / same_count[ut],
+  expected_wr = (solo_wr[ut[, 1]] + solo_wr[ut[, 2]]) / 2
+)
+syn$synergy <- syn$pair_wr - syn$expected_wr
+
+syn <- syn[syn$games >= 50, ]
+```
+
+```{r}
+hist(syn$synergy, breaks = 50, col = "steelblue", border = "white",
+     xlab = "Pair win rate − expected (additive)",
+     main = "Hero-pair synergy distribution")
+abline(v = 0, col = "red", lwd = 2)
+```
+
+```{r}
+cat("Pairs analyzed:", nrow(syn),
+    "| mean:", round(mean(syn$synergy), 4),
+    "| SD:", round(sd(syn$synergy), 4), "\n")
+```
+
+Synergy value defined as a pair of heroes joint win rate minus win rate expected from each individual heroes' win rate. Across 5,443 hero pairs with at least 50 games each, synergy values for a symmetric and roughly normal distribution centered very close to 0 (-0.0083). The near-zero mean indicates that on average, hero pairs perform almost as precisely as their individual win rates would predict, with no bonus or penalty from potentially "strong" or "weak" pairs. The small SD of \~5% means most pairs deviate from their additive expectation. In the context of our modeling results, this shows why the more flexible model (XGBoost) did not improve significantly over the prior linear models (logistic regression and lasso).
